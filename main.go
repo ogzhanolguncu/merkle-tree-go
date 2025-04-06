@@ -1,114 +1,296 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
-	"slices"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
-	// For simple serialization example
-	// Include your MerkleTree struct and functions here...
+	"strings"
+	"time"
 )
 
-// Helper function to prepare data blocks from a map
-func prepareDataBlocks(input map[string]string) ([][]byte, []string, error) {
-	if len(input) == 0 {
-		// Decide how to handle empty maps - maybe return ErrEmptyMessage?
-		// Or return empty slices if that's valid for your comparison logic.
-		return [][]byte{}, []string{}, nil // Or return an error if empty maps aren't comparable
-	}
-
-	// 1. Get keys
-	keys := make([]string, 0, len(input))
-	for k := range input {
-		keys = append(keys, k)
-	}
-
-	// 2. Sort keys consistently
-	sort.Strings(keys)
-
-	// 3. Create ordered data blocks
-	dataBlocks := make([][]byte, 0, len(keys))
-	for _, k := range keys {
-		v := input[k]
-		// 4. Serialize consistently (e.g., key:value)
-		//    IMPORTANT: Choose a robust serialization for real-world use.
-		//    This simple example assumes ':' doesn't appear in keys/values.
-		serializedPair := fmt.Appendf(nil, "%s:%s", k, v)
-		dataBlocks = append(dataBlocks, serializedPair)
-	}
-
-	// Return both the blocks and the order of keys used
-	return dataBlocks, keys, nil
+// DirectorySync uses Merkle trees to efficiently sync directories
+type DirectorySync struct {
+	SourceDir      string
+	DestinationDir string
 }
 
-func main() {
-	// Your two datasets
-	input1 := map[string]string{"C": "D3", "B": "D2", "A": "D1"}
-	input2 := map[string]string{"C": "D3", "B": "D2", "A": "D7"} // Difference in A
+// FileInfo stores metadata about a file used for syncing
+type FileInfo struct {
+	Path         string    // Relative path from root directory
+	Size         int64     // File size in bytes
+	LastModified time.Time // Last modification time
+	IsDir        bool      // Is this a directory
+	Hash         []byte    // Hash of file contents (nil for directories)
+}
 
-	// Prepare data for Merkle Tree construction
-	dataBlocks1, sortedKeys1, err1 := prepareDataBlocks(input1)
-	if err1 != nil {
-		fmt.Println("Error preparing data 1:", err1)
-		return
+// BuildDirectoryTree scans a directory and builds a list of FileInfo
+func (ds *DirectorySync) BuildDirectoryTree(rootDir string) ([]FileInfo, error) {
+	var files []FileInfo
+
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Get path relative to root directory
+		relPath, err := filepath.Rel(rootDir, path)
+		if err != nil {
+			return err
+		}
+
+		// Skip the root directory itself
+		if relPath == "." {
+			return nil
+		}
+
+		// Normalize path separator for consistency
+		relPath = filepath.ToSlash(relPath)
+
+		fileInfo := FileInfo{
+			Path:         relPath,
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+			IsDir:        info.IsDir(),
+		}
+
+		// Calculate hash for files, not directories
+		if !info.IsDir() {
+			hash, err := hashFile(path)
+			if err != nil {
+				return err
+			}
+			fileInfo.Hash = hash
+		}
+
+		files = append(files, fileInfo)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	dataBlocks2, sortedKeys2, err2 := prepareDataBlocks(input2)
-	if err2 != nil {
-		fmt.Println("Error preparing data 2:", err2)
-		return
+	// Sort files by path for consistent ordering
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+
+	return files, nil
+}
+
+// hashFile calculates the SHA-256 hash of a file's contents
+func hashFile(filePath string) ([]byte, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return nil, err
 	}
 
-	// --- Build Trees using your implementation ---
-	tree1, errTree1 := NewTree(dataBlocks1)
-	if errTree1 != nil {
-		fmt.Println("Error building tree 1:", errTree1)
-		return
+	return hash.Sum(nil), nil
+}
+
+// BuildMerkleTree creates a Merkle tree from file info list
+func (ds *DirectorySync) BuildMerkleTree(files []FileInfo) (*MerkleTree, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files to build tree from")
 	}
-	root1 := tree1.GetRoot()
-	fmt.Printf("Tree 1 Root: %x\n", root1)
 
-	tree2, errTree2 := NewTree(dataBlocks2)
-	if errTree2 != nil {
-		fmt.Println("Error building tree 2:", errTree2)
-		return
-	}
-	root2 := tree2.GetRoot()
-	fmt.Printf("Tree 2 Root: %x\n", root2)
-
-	// --- Compare Roots ---
-	if slices.Equal(root1, root2) {
-		fmt.Println("\nDatasets are identical.")
-	} else {
-		fmt.Println("\nDatasets differ!")
-
-		// --- Find the Faulty Section using current implementation ---
-		// We compare the leaves. Since the data was ordered by sorted keys,
-		// the leaf indices correspond to the sorted key indices.
-		leaves1 := tree1.GetLeaves()
-		leaves2 := tree2.GetLeaves()
-
-		if len(leaves1) != len(leaves2) {
-			fmt.Printf("Difference in number of items: %d vs %d\n", len(leaves1), len(leaves2))
-			// More complex diffing might be needed if keys themselves differ
-		} else if !slices.Equal(sortedKeys1, sortedKeys2) {
-			fmt.Println("Difference in the set of keys!")
-			// Add logic here to show which keys are added/removed
+	// Create data blocks from file info
+	dataBlocks := make([][]byte, len(files))
+	for i, file := range files {
+		// For directories, create a special hash based on path + isDir flag
+		if file.IsDir {
+			h := sha256.New()
+			h.Write([]byte(file.Path + ":dir"))
+			dataBlocks[i] = h.Sum(nil)
 		} else {
-			fmt.Println("Differences found in values:")
-			for i := range leaves1 {
-				if !slices.Equal(leaves1[i], leaves2[i]) {
-					// Found a difference! Map index back to the key.
-					differingKey := sortedKeys1[i] // or sortedKeys2[i], they are the same
-					// Note: leaves are HASHES of the serialized data.
-					// To show the actual differing values, you might need the original dataBlocks
-					originalValue1 := string(dataBlocks1[i]) // Shows "key:value"
-					originalValue2 := string(dataBlocks2[i]) // Shows "key:value"
+			// For files, use the pre-calculated file hash
+			dataBlocks[i] = file.Hash
+		}
+	}
 
-					fmt.Printf("  - Difference at key '%s':\n", differingKey)
-					fmt.Printf("    Dataset 1 (%x): %s\n", leaves1[i], originalValue1)
-					fmt.Printf("    Dataset 2 (%x): %s\n", leaves2[i], originalValue2)
-				}
+	// Build the Merkle tree
+	return NewTree(dataBlocks)
+}
+
+// CompareTrees identifies differences between source and destination
+func (ds *DirectorySync) CompareTrees(sourceFiles, destFiles []FileInfo) ([]FileInfo, []string, error) {
+	// Create maps for quick lookup
+	sourceMap := make(map[string]FileInfo)
+	destMap := make(map[string]FileInfo)
+
+	for _, file := range sourceFiles {
+		sourceMap[file.Path] = file
+	}
+
+	for _, file := range destFiles {
+		destMap[file.Path] = file
+	}
+
+	// Find files to copy (new or modified)
+	var filesToCopy []FileInfo
+	var filesToDelete []string
+
+	// Find files in source that need to be copied to destination
+	for _, file := range sourceFiles {
+		destFile, exists := destMap[file.Path]
+
+		// If file doesn't exist in destination or is different, copy it
+		if !exists {
+			filesToCopy = append(filesToCopy, file)
+		} else if !file.IsDir && !bytes.Equal(file.Hash, destFile.Hash) {
+			filesToCopy = append(filesToCopy, file)
+		}
+	}
+
+	// Find files in destination that don't exist in source (to be deleted)
+	for _, file := range destFiles {
+		_, exists := sourceMap[file.Path]
+		if !exists {
+			filesToDelete = append(filesToDelete, file.Path)
+		}
+	}
+
+	return filesToCopy, filesToDelete, nil
+}
+
+// SyncDirectories synchronizes files from source to destination
+func (ds *DirectorySync) SyncDirectories() error {
+	fmt.Println("Building source directory tree...")
+	sourceFiles, err := ds.BuildDirectoryTree(ds.SourceDir)
+	if err != nil {
+		return fmt.Errorf("error scanning source directory: %v", err)
+	}
+
+	fmt.Println("Building destination directory tree...")
+	destFiles, err := ds.BuildDirectoryTree(ds.DestinationDir)
+	if err != nil {
+		return fmt.Errorf("error scanning destination directory: %v", err)
+	}
+
+	fmt.Println("Building Merkle trees...")
+	sourceTree, err := ds.BuildMerkleTree(sourceFiles)
+	if err != nil {
+		return fmt.Errorf("error building source tree: %v", err)
+	}
+
+	destTree, err := ds.BuildMerkleTree(destFiles)
+	if err != nil {
+		// If destination is empty, just copy everything
+		if strings.Contains(err.Error(), "no files") {
+			destTree = nil
+		} else {
+			return fmt.Errorf("error building destination tree: %v", err)
+		}
+	}
+
+	// Quick check - if root hashes match, directories are identical
+	if destTree != nil && bytes.Equal(sourceTree.Root, destTree.Root) {
+		fmt.Println("Directories are already in sync.")
+		return nil
+	}
+
+	fmt.Println("Finding differences...")
+	filesToCopy, filesToDelete, err := ds.CompareTrees(sourceFiles, destFiles)
+	if err != nil {
+		return fmt.Errorf("error comparing trees: %v", err)
+	}
+
+	// First create directories
+	for _, file := range filesToCopy {
+		if file.IsDir {
+			destPath := filepath.Join(ds.DestinationDir, file.Path)
+			fmt.Printf("Creating directory: %s\n", file.Path)
+			if err := os.MkdirAll(destPath, 0755); err != nil {
+				return fmt.Errorf("error creating directory %s: %v", destPath, err)
 			}
 		}
+	}
+
+	// Then copy files
+	for _, file := range filesToCopy {
+		if !file.IsDir {
+			srcPath := filepath.Join(ds.SourceDir, file.Path)
+			destPath := filepath.Join(ds.DestinationDir, file.Path)
+
+			// Ensure the destination directory exists
+			destDir := filepath.Dir(destPath)
+			if err := os.MkdirAll(destDir, 0755); err != nil {
+				return fmt.Errorf("error creating directory %s: %v", destDir, err)
+			}
+
+			fmt.Printf("Copying file: %s\n", file.Path)
+			if err := copyFile(srcPath, destPath); err != nil {
+				return fmt.Errorf("error copying %s: %v", file.Path, err)
+			}
+		}
+	}
+
+	// Delete files that don't exist in source
+	for _, path := range filesToDelete {
+		fullPath := filepath.Join(ds.DestinationDir, path)
+		fmt.Printf("Deleting: %s\n", path)
+		if err := os.RemoveAll(fullPath); err != nil {
+			return fmt.Errorf("error deleting %s: %v", path, err)
+		}
+	}
+
+	fmt.Println("Sync complete!")
+	return nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return err
+	}
+
+	// Copy file permissions
+	sourceInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, sourceInfo.Mode())
+}
+
+// Main function to show usage
+func main() {
+	if len(os.Args) != 3 {
+		fmt.Println("Usage: go run merkle_sync.go <source_dir> <destination_dir>")
+		os.Exit(1)
+	}
+
+	sourceDir := os.Args[1]
+	destDir := os.Args[2]
+
+	syncer := &DirectorySync{
+		SourceDir:      sourceDir,
+		DestinationDir: destDir,
+	}
+
+	if err := syncer.SyncDirectories(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 }
