@@ -19,14 +19,13 @@ func createTestDataBlocks(items ...string) [][]byte {
 	return blocks
 }
 
-// Helper to calculate hash (useful for manual checks)
 func hashData(data []byte) []byte {
 	h := sha256.Sum256(data)
 	return h[:]
 }
 
 func hashPair(h1, h2 []byte) []byte {
-	combined := slices.Concat(h1, h2) // Requires Go 1.22+
+	combined := slices.Concat(h1, h2)
 	h := sha256.Sum256(combined)
 	return h[:]
 }
